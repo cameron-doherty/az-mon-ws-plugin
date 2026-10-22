@@ -1,0 +1,17 @@
+{
+  "name": "azmon-ws-plugin-marketplace",
+  "owner": {
+    "name": "Azure SRE Agent Community"
+  },
+  "metadata": {
+    "description": "Azure Monitor Workspace (Managed Prometheus) & OpenTelemetry telemetry plugins for Azure SRE Agent",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "azure-monitor-workspace-promql",
+      "description": "Query Azure Monitor Workspace (Managed Prometheus) via PromQL to analyze OpenTelemetry hostmetrics and process performance telemetry across Linux and Windows machines.",
+      "source": "."
+    }
+  ]
+}

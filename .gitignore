@@ -1,0 +1,43 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables, credentials, and local secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.cer
+*secret*
+*credentials*
+*token*
+
+# Local test outputs & scratch artifacts
+*.log
+*.tmp
+*.bak
+tmp/
+temp/
+out/
+output/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

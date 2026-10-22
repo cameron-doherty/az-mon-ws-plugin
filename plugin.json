@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "azure-monitor-workspace-promql",
+  "version": "1.0.0",
+  "description": "Azure Monitor Workspace (Managed Prometheus) & OpenTelemetry machine telemetry plugin for Azure SRE Agent and GitHub Copilot. Enables PromQL discovery, query execution, statistical summarization, and Linux/Windows OTel hostmetrics & process troubleshooting using built-in Azure CLI and Python tools.",
+  "license": "MIT",
+  "skills": [
+    "skills/"
+  ]
+}
