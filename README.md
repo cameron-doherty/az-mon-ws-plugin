@@ -116,24 +116,27 @@ This plugin is **dual-runtime compatible** with both **Azure SRE Agent** and the
    # Discover Azure Monitor Workspaces and their Prometheus endpoints
    python .\skills\azmon_workspace_promql\scripts\promql_helper.py discover
 
-   # Run a range query directly and summarize min/max/avg/p95/latest
+   # Run a range query directly (using dot-separated OTel metric & label syntax) and summarize min/max/avg/p95/latest
    python .\skills\azmon_workspace_promql\scripts\promql_helper.py run `
      --endpoint "https://<workspace>.<region>.prometheus.monitor.azure.com" `
      --api query_range `
-     --query 'sum by (host_name, state) (rate(system_cpu_time_seconds_total[5m]))' `
-     --start "-1h" --end "now" --step "1m"
+     --query '(1 - avg by ("microsoft.resourceid") ({__name__="system.cpu.utilization", state="idle"})) * 100' `
+     --start "-2h" --end "now" --step "5m"
    ```
 
 ---
 
 ## Key Nuances & Gotchas Addressed by This Plugin
 
-1. **Mandatory Single `__name__` Matcher**: Azure Monitor Workspace requires every `/query`, `/query_range`, and `/series` call to include a single metric name (`__name__`). Bare label selectors like `{host_name="vm01"}` or regex metric selectors like `{__name__=~"system_cpu.*"}` are rejected by the service.
-2. **Label Values Endpoint Limitation**: `/api/v1/label/<label>/values` is **only** supported for `__name__` (`/api/v1/label/__name__/values`). To discover values for `host_name`, `instance`, `job`, or `os_type`, the plugin uses `/api/v1/series?match[]=<metric_name>` or `group by (<label>) (<metric_name>)`.
-3. **No Regex in `/api/v1/series` & 12-Hour Clamp**: `/api/v1/series` rejects `=~` and `!~` regex matchers and clamps queries to a maximum 12-hour window.
-4. **32-Day Maximum Range Window**: `/api/v1/query_range` allows up to 32 days total, **including** any range-vector lookback inside the PromQL expression (e.g., `rate(m[1h])` over 24 hours queries 25 hours).
-5. **Case-Insensitivity**: Azure Managed Prometheus treats metric names, label names, and label values as case-insensitive.
-6. **`RunAzCliReadCommands` Safe Execution**:
+1. **Dot-Separated Metric & Label Names (`system.cpu.utilization`, `microsoft.resourceid`)**:
+   - Azure Managed Prometheus with OTel collectors (and Azure Arc / AMA pipelines) frequently stores OTel metrics and labels with **dots** instead of underscores (e.g., `system.cpu.utilization`, `system.memory.utilization`, `process.cpu.utilization`, `microsoft.resourceid`, `process.executable.name`).
+   - Dot-named metrics **must** use `{__name__="<metric>"}` selector syntax (e.g., `{__name__="system.cpu.utilization", state="idle"}`), and dot-named labels **must** be double-quoted in grouping clauses (e.g., `avg by ("microsoft.resourceid") (...)`).
+2. **Mandatory Single `__name__` Matcher**: Azure Monitor Workspace requires every `/query`, `/query_range`, and `/series` call to include a single metric name (`__name__`). Bare label selectors like `{state="idle"}` or regex metric selectors like `{__name__=~"system.*"}` are rejected by the service.
+3. **Label Values Endpoint Limitation**: `/api/v1/label/<label>/values` is **only** supported for `__name__` (`/api/v1/label/__name__/values`). To discover machines and label values, the plugin uses `/api/v1/series?match[]={__name__="<metric>"}` or an unfiltered instant query `{__name__="<metric>"}`.
+4. **No Regex in `/api/v1/series` & 12-Hour Clamp**: `/api/v1/series` rejects `=~` and `!~` regex matchers and clamps queries to a maximum 12-hour window.
+5. **32-Day Maximum Range Window**: `/api/v1/query_range` allows up to 32 days total, **including** any range-vector lookback inside the PromQL expression (e.g., `rate(m[1h])` over 24 hours queries 25 hours).
+6. **Case-Insensitivity**: Azure Managed Prometheus treats metric names, label names, and label values as case-insensitive.
+7. **`RunAzCliReadCommands` Safe Execution**:
    - Always uses `az rest --method get --resource "https://prometheus.monitor.azure.com"` so queries execute under `RunAzCliReadCommands` without write-approval prompts.
    - Never passes `-o` / `--output` or `--query` flags to `RunAzCliReadCommands` (which causes SRE Agent's read wrapper to fail).
 

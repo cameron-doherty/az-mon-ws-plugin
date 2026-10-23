@@ -163,12 +163,36 @@ def extract_max_lookback_seconds(promql: str) -> float:
     return max(parse_duration_seconds(lb) for lb in lookbacks)
 
 
+def normalize_series_matcher(matcher: str) -> str:
+    """
+    Normalize a `/api/v1/series` `match[]` selector so dot-separated metric names
+    (e.g. `system.cpu.utilization` or `system.cpu.utilization{state="idle"}`) are
+    automatically rewritten into valid `{__name__="system.cpu.utilization", ...}` syntax.
+    """
+    m = matcher.strip()
+    # Bare dot-separated metric name: `system.cpu.utilization`
+    if re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+", m):
+        return f'{{__name__="{m}"}}'
+    # Dot-separated metric name with selector braces: `system.cpu.utilization{state="idle"}`
+    match_with_braces = re.fullmatch(
+        r"([a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+)\s*\{([^}]*)\}", m
+    )
+    if match_with_braces:
+        metric_name, inner = match_with_braces.group(1), match_with_braces.group(2).strip()
+        if inner:
+            return f'{{__name__="{metric_name}", {inner}}}'
+        return f'{{__name__="{metric_name}"}}'
+    return m
+
+
 def validate_promql_query(promql: str) -> Dict[str, Any]:
     """
     Validate a PromQL expression against Azure Monitor Workspace API rules:
     1. Must not be empty.
     2. Must include a metric name (`__name__` matcher), not a bare `{label="val"}` selector.
     3. Cannot use regex on `__name__` (`__name__=~` or `__name__!~`).
+    4. Dot-separated metric names (e.g. `system.cpu.utilization`) must use `{__name__="..."}` selector syntax.
+    5. Dot-separated label names (e.g. `microsoft.resourceid`) must be double-quoted in `by ("...")` and selectors.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -177,25 +201,64 @@ def validate_promql_query(promql: str) -> Dict[str, Any]:
         return {"valid": False, "errors": ["PromQL query cannot be empty."], "warnings": []}
 
     q = promql.strip()
-    if re.search(r"__name__\s*(?:=~|!~|!=)", q):
+    if re.search(r'(?:__name__|"__name__"|\'__name__\')\s*(?:=~|!~|!=)', q):
         errors.append(
-            "Azure Monitor Workspace requires an exact metric name (`__name__=\"<metric>\"` or `<metric>{...}`). "
+            'Azure Monitor Workspace requires an exact metric name (`{__name__="<metric>"}` or `<metric>{...}`). '
             "Regex or negative matchers on `__name__` (`=~`, `!~`, `!=`) are not supported."
         )
 
-    # Strip quoted strings before inspecting tokens
+    # Extract explicit `__name__="<metric>"` values before stripping string literals
+    explicit_name_matches = re.findall(
+        r'(?:__name__|"__name__"|\'__name__\')\s*=\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|\'([^\'\\]*(?:\\.[^\'\\]*)*)\')',
+        q,
+    )
+    explicit_metrics = [m[0] or m[1] for m in explicit_name_matches if (m[0] or m[1])]
+
+    # Strip quoted strings before inspecting unquoted tokens
     no_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', q)
 
     # Check if there is an explicit exact __name__="metric"
-    has_explicit_name = bool(re.search(r"__name__\s*=\s*\"\"", no_strings))
+    has_explicit_name = bool(re.search(r'(?:\b__name__|""\s*)\s*=\s*""', no_strings)) and bool(explicit_metrics)
+
+    # Check for unquoted dot-separated label names in grouping clauses: `by (microsoft.resourceid)`
+    grouping_clauses = re.findall(
+        r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)",
+        no_strings,
+        flags=re.IGNORECASE,
+    )
+    for clause_body in grouping_clauses:
+        dotted_labels = re.findall(r"[a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+", clause_body)
+        if dotted_labels:
+            sample = dotted_labels[0]
+            errors.append(
+                f'Unquoted dot-separated label name `{sample}` in grouping clause. '
+                f'Labels containing dots must be double-quoted in PromQL, e.g. `by ("{sample}")`.'
+            )
+            break
+
+    # Check selector blocks `{...}` for bare selectors or unquoted dot-label names
+    all_selectors = re.findall(r"\{([^}]*)\}", no_strings)
+    for selector_body in all_selectors:
+        dotted_selector_labels = re.findall(
+            r"([a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+)\s*(?:=!|=~|!~|=)",
+            selector_body,
+        )
+        if dotted_selector_labels:
+            sample = dotted_selector_labels[0]
+            errors.append(
+                f'Unquoted dot-separated label name `{sample}` in label selector. '
+                f'Quote label names containing dots or filter via grouping.'
+            )
+            break
 
     # Detect bare selector `{foo="bar"}` not preceded by a metric identifier
     bare_selectors = re.findall(r"(?:^|[\(\s,\+\-\*/%\^=<>!])\{([^}]*)\}", no_strings)
     for selector_body in bare_selectors:
-        if not re.search(r"\b__name__\s*=\s*\"\"", selector_body):
+        if not re.search(r'(?:\b__name__|""\s*)\s*=\s*""', selector_body):
             errors.append(
                 "Azure Monitor Workspace requires every time-series selector to include a `__name__` metric matcher "
-                "(e.g. `system_cpu_time_seconds_total{...}`). Bare label selectors like `{host_name=\"...\"}` fail with HTTP 400/422."
+                '(e.g. `{__name__="system.cpu.utilization", state="idle"}` or `system_cpu_time_seconds_total{...}`). '
+                'Bare label selectors like `{state="idle"}` fail with HTTP 400/422.'
             )
             break
 
@@ -210,18 +273,29 @@ def validate_promql_query(promql: str) -> Dict[str, Any]:
     # Remove range lookbacks like `[5m]`
     outside_braces = re.sub(r"\[[^\]]*\]", "", outside_braces)
 
-    # Extract candidate metric identifiers (tokens not immediately followed by '(' and not keywords)
-    tokens = re.findall(r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\b(?!\s*\()", outside_braces)
-    metric_tokens = [t for t in tokens if t.lower() not in PROMQL_KEYWORDS]
-
-    if not has_explicit_name and not metric_tokens:
+    # Check for unquoted dot-separated metric names outside braces (e.g. `system.cpu.utilization`)
+    dotted_metrics = re.findall(r"[a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+", outside_braces)
+    if dotted_metrics:
+        sample = dotted_metrics[0]
         errors.append(
-            "Query does not contain a recognizable metric name (`__name__`). "
-            "Every `/query` or `/query_range` request in Azure Monitor Workspace must be scoped to a metric."
+            f'Dot-separated metric name `{sample}` cannot be used as a bare PromQL identifier. '
+            f'Use the `__name__` selector syntax instead: `{{__name__="{sample}"}}`.'
         )
 
-    distinct_metrics = []
-    for m in metric_tokens:
+    # Extract candidate bare metric identifiers (tokens not immediately followed by '(' and not keywords)
+    outside_without_dotted = re.sub(r"[a-zA-Z_:][a-zA-Z0-9_:]*(?:\.[a-zA-Z0-9_:]+)+", "", outside_braces)
+    tokens = re.findall(r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\b(?!\s*\()", outside_without_dotted)
+    metric_tokens = [t for t in tokens if t.lower() not in PROMQL_KEYWORDS]
+
+    if not has_explicit_name and not metric_tokens and not dotted_metrics:
+        errors.append(
+            "Query does not contain a recognizable metric name (`__name__`). "
+            'Every `/query` or `/query_range` request in Azure Monitor Workspace must be scoped to a metric '
+            '(e.g. `{__name__="system.cpu.utilization"}`).'
+        )
+
+    distinct_metrics: List[str] = []
+    for m in explicit_metrics + metric_tokens:
         if m not in distinct_metrics:
             distinct_metrics.append(m)
 
@@ -255,24 +329,27 @@ def validate_series_matcher(matchers: List[str]) -> Dict[str, Any]:
     3. Each matcher must include a metric name (`__name__`).
     """
     errors: List[str] = []
+    normalized_matchers: List[str] = []
     if not matchers:
         return {"valid": False, "errors": ["At least one `match[]` selector is required for `/api/v1/series`."]}
 
     for matcher in matchers:
-        m = matcher.strip()
+        m = normalize_series_matcher(matcher)
+        normalized_matchers.append(m)
         if "=~" in m or "!~" in m:
             errors.append(
                 f"Invalid `/series` matcher `{m}`: Azure Monitor Workspace `/api/v1/series` does NOT support regular expression filters (`=~` or `!~`)."
             )
         no_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', m)
-        has_Leading_metric = bool(re.match(r"^[a-zA-Z_:][a-zA-Z0-9_:]*", no_strings))
-        has_explicit_name = "__name__" in no_strings
-        if not has_Leading_metric and not has_explicit_name:
+        has_leading_metric = bool(re.match(r"^[a-zA-Z_:][a-zA-Z0-9_:]*(\{|$)", no_strings))
+        has_explicit_name = "__name__" in no_strings or bool(re.search(r'"__name__"|\'__name__\'', m))
+        if not has_leading_metric and not has_explicit_name:
             errors.append(
-                f"Invalid `/series` matcher `{m}`: Must include a metric name (e.g. `system_cpu_time_seconds_total` or `target_info{{host_name=\"vm01\"}}`)."
+                f"Invalid `/series` matcher `{m}`: Must include a metric name "
+                '(e.g. `{__name__="system.cpu.utilization"}` or `system_cpu_time_seconds_total`).'
             )
 
-    return {"valid": len(errors) == 0, "errors": errors}
+    return {"valid": len(errors) == 0, "errors": errors, "normalized_matchers": normalized_matchers}
 
 
 def normalize_endpoint(endpoint: str) -> str:
@@ -334,7 +411,8 @@ def build_az_rest_request(
                 "Requested `/series` window exceeds Azure Monitor Workspace's 12-hour limit; clamped `start` to `end - 12h`."
             )
             start_dt = end_dt - dt.timedelta(seconds=MAX_SERIES_RANGE_SECONDS)
-        params: List[Tuple[str, str]] = [("match[]", m.strip()) for m in match_list]
+        normalized_matches = validation.get("normalized_matchers", [m.strip() for m in match_list])
+        params: List[Tuple[str, str]] = [("match[]", m) for m in normalized_matches]
         params.append(("start", format_rfc3339(start_dt)))
         params.append(("end", format_rfc3339(end_dt)))
         path = "/api/v1/series"
@@ -515,25 +593,39 @@ def acquire_prometheus_token(explicit_token: Optional[str] = None) -> Optional[s
 
 
 def classify_otel_metric(metric_name: str) -> str:
-    """Categorize a Prometheus metric name into an OpenTelemetry host/process domain."""
+    """Categorize a Prometheus metric name (dot-separated or underscore-separated) into an OTel host/process domain."""
     m = metric_name.lower()
     if "target_info" in m or "otel_scope_info" in m:
         return "metadata_target_info"
+    if m.startswith(("process.", "process_")) or ".process." in m or "_process_" in m:
+        return "process"
     if "cpu" in m or "load_average" in m:
         return "cpu"
     if "paging" in m or "swap" in m or "pagefile" in m:
         return "paging"
-    if "memory" in m or "mem_" in m:
+    if "memory" in m or "mem_" in m or "mem." in m:
         return "memory"
-    if "filesystem" in m or "fs_" in m:
+    if "filesystem" in m or "fs_" in m or "fs." in m:
         return "filesystem"
     if "disk" in m:
         return "disk"
-    if "network" in m or "net_" in m or "tcp" in m:
+    if "network" in m or "net_" in m or "net." in m or "tcp" in m:
         return "network"
-    if m.startswith("process_") or "_process_" in m:
-        return "process"
     return "other"
+
+
+def _extract_machine_name_from_labels(labels: Dict[str, Any]) -> Optional[str]:
+    """Extract a short machine name from `microsoft.resourceid`, `host.name`, or `host_name`."""
+    for k, v in labels.items():
+        kl = k.lower()
+        if kl in ("host.name", "host_name", "hostname") and v:
+            return str(v)
+    for k, v in labels.items():
+        if k.lower() in ("microsoft.resourceid", "microsoft_resourceid", "cloud.resource_id", "cloud_resource_id") and v:
+            parts = str(v).rstrip("/").split("/")
+            if parts:
+                return parts[-1]
+    return None
 
 
 def _compute_percentile(sorted_vals: List[float], pct: float) -> float:
@@ -584,14 +676,33 @@ def summarize_prometheus_response(
         for item in items:
             cat = classify_otel_metric(item)
             grouped.setdefault(cat, []).append(item)
-        return {
+        dot_count = sum(1 for x in items if "." in x)
+        underscore_otel_count = sum(
+            1 for x in items if "." not in x and classify_otel_metric(x) != "other"
+        )
+        if dot_count > 0 and underscore_otel_count == 0:
+            naming_convention = "dot_separated"
+        elif dot_count > 0 and underscore_otel_count > 0:
+            naming_convention = "mixed_dot_and_underscore"
+        else:
+            naming_convention = "underscore_separated"
+
+        result_obj: Dict[str, Any] = {
             "status": "success",
             "resultType": "string_list",
             "total_count": len(data),
             "filtered_count": len(items),
+            "naming_convention": naming_convention,
             "grouped_by_otel_domain": {k: sorted(v)[:top_n] for k, v in sorted(grouped.items())},
             "sample_values": sorted(items)[: min(len(items), top_n * 4)],
         }
+        if dot_count > 0:
+            result_obj["promql_syntax_hint"] = (
+                "Dot-separated metric names detected (e.g. `system.cpu.utilization`). "
+                'Use `{__name__="<metric>"}` selector syntax (NOT bare metric identifiers) and double-quote '
+                'dot-separated label names in aggregation clauses, e.g. `avg by ("microsoft.resourceid") ({__name__="system.cpu.utilization"})`.'
+            )
+        return result_obj
 
     # 2. `/api/v1/series` -> list of label dicts
     if isinstance(data, list) and all(isinstance(x, dict) for x in data):
@@ -602,9 +713,36 @@ def summarize_prometheus_response(
                 s for s in series_list if any(regex.search(f"{k}={v}") for k, v in s.items())
             ]
         label_keys: Dict[str, set] = {}
+        machines: Dict[str, Dict[str, Any]] = {}
+        linux_states = {"nice", "softirq", "steal", "wait", "iowait"}
         for s in series_list:
             for k, v in s.items():
                 label_keys.setdefault(k, set()).add(str(v))
+            m_name = _extract_machine_name_from_labels(s)
+            if m_name:
+                info = machines.setdefault(m_name, {"machine_name": m_name})
+                res_id = s.get("microsoft.resourceid") or s.get("microsoft_resourceid")
+                if res_id:
+                    info["resource_id"] = res_id
+                rg = s.get("microsoft.resourcegroupname") or s.get("microsoft_resourcegroupname")
+                if rg:
+                    info["resource_group"] = rg
+                sub_id = s.get("microsoft.subscriptionid") or s.get("microsoft_subscriptionid")
+                if sub_id:
+                    info["subscription_id"] = sub_id
+                if "cpu" in s:
+                    info.setdefault("cpus", set()).add(str(s["cpu"]))
+                    info["os_hint"] = "Windows (per-core `cpu` label present)"
+                state_val = str(s.get("state", "")).lower()
+                if state_val in linux_states:
+                    info["os_hint"] = f"Linux (state='{state_val}' present)"
+
+        for m_info in machines.values():
+            if "cpus" in m_info:
+                cpus_sorted = sorted(m_info["cpus"])
+                m_info["cpu_count"] = len(cpus_sorted)
+                m_info["cpus"] = cpus_sorted
+
         distinct_summary = {
             k: {
                 "distinct_count": len(vals),
@@ -612,14 +750,24 @@ def summarize_prometheus_response(
             }
             for k, vals in sorted(label_keys.items())
         }
-        return {
+        dot_labels = sorted(k for k in label_keys if "." in k)
+        series_summary_obj: Dict[str, Any] = {
             "status": "success",
             "resultType": "series_list",
             "total_series": len(data),
             "filtered_series": len(series_list),
             "label_value_summary": distinct_summary,
-            "sample_series": series_list[:top_n],
         }
+        if machines:
+            series_summary_obj["discovered_machines"] = list(machines.values())[:top_n]
+        if dot_labels:
+            series_summary_obj["dot_label_keys"] = dot_labels
+            series_summary_obj["promql_syntax_hint"] = (
+                f"Dot-separated label names detected ({', '.join(dot_labels)}). "
+                'Double-quote these label names in `by ("...")` / `without ("...")` clauses.'
+            )
+        series_summary_obj["sample_series"] = series_list[:top_n]
+        return series_summary_obj
 
     # 3. `/api/v1/query` or `/api/v1/query_range` -> dict with `resultType` and `result`
     if isinstance(data, dict):
@@ -674,9 +822,14 @@ def summarize_prometheus_response(
             avg_val = sum(values_only) / len(values_only)
             p95_val = _compute_percentile(sorted_vals, 95.0)
 
-            summaries.append(
+            entry_summary: Dict[str, Any] = {
+                "metric": metric_labels,
+            }
+            machine_name = _extract_machine_name_from_labels(metric_labels)
+            if machine_name:
+                entry_summary["machine_name"] = machine_name
+            entry_summary.update(
                 {
-                    "metric": metric_labels,
                     "samples": len(parsed_points),
                     "min": round(min_pt[1], 6),
                     "max": round(max_pt[1], 6),
@@ -693,6 +846,7 @@ def summarize_prometheus_response(
                     ),
                 }
             )
+            summaries.append(entry_summary)
 
         # Sort descending by `max` then `latest`
         summaries.sort(key=lambda s: (s["max"], s["latest"]), reverse=True)
